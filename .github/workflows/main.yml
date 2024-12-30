@@ -1,0 +1,68 @@
+name: Deploy Node App to GCP
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Google Auth
+        id: auth
+        uses: google-github-actions/auth@v1
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v1
+
+      - name: Get GitHub Actions IP
+        id: ip
+        run: |
+          CURRENT_IP=$(curl -s https://api.ipify.org)
+          echo "ACTION_IP=$CURRENT_IP" >> $GITHUB_ENV
+          echo "Current IP: $CURRENT_IP"
+
+      - name: Create Temporary Firewall Rule
+        run: |
+          RULE_NAME="temp-deploy-$(date +%s)"
+          echo "RULE_NAME=$RULE_NAME" >> $GITHUB_ENV
+          
+          gcloud compute firewall-rules create $RULE_NAME \
+            --direction=INGRESS \
+            --priority=1000 \
+            --network=default \
+            --action=ALLOW \
+            --rules=tcp:22 \
+            --source-ranges=${{ env.ACTION_IP }}/32 \
+            --target-tags=${{ secrets.VM_TAG }}
+          
+          # Wait for firewall rule to propagate
+          sleep 30
+
+      - name: Deploy to VM Instance
+        run: |
+          # Create app directory
+          gcloud compute ssh ${{ secrets.VM_NAME }} --zone=${{ secrets.ZONE }} \
+            --command="mkdir -p ~/node-app"
+
+          # Copy files to the instance
+          gcloud compute scp --zone=${{ secrets.ZONE }} --recurse ./* ${{ secrets.VM_NAME }}:~/node-app/
+
+          # Install dependencies and restart app
+          gcloud compute ssh ${{ secrets.VM_NAME }} --zone=${{ secrets.ZONE }} \
+            --command="cd ~/node-app && \
+                      npm install && \
+                      pm2 delete node-app || true && \
+                      pm2 start index.js --name node-app"
+
+      - name: Remove Temporary Firewall Rule
+        if: always()
+        run: |
+          gcloud compute firewall-rules delete ${{ env.RULE_NAME }} --quiet
